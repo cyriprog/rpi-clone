@@ -16,6 +16,8 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 # auto run grub-install if grub detected
 grub_auto=1
 
+MIN_IMAGE_SIZE=$(( 500 * 1024 * 1024 ))
+
 PGM=`basename $0`
 setup_command="$PGM-setup"
 
@@ -95,14 +97,16 @@ HOSTNAME=`hostname`
 usage()
 	{
 	echo $"
-usage: $PGM sdN {-v|--verbose} {-f|--force-initialize} {-f2}
+usage: $PGM [sdN | {-i|--image} image_file ] {-v|--verbose} {-f|--force-initialize} {-f2}
          {-p|--p1-size size} {-u|--unattended} {-U|--Unattended} {-q|--quiet}
          {-s|--setup host} {-e|--edit-fstab sdX } {-m|--mountdir dir }
          {-L|--label-partitions label} {-l|--leave-sd-usb-boot}
          {-a|--all-sync} {-F|--Force-sync} {-x} {-V|--version}
          {--convert-fstab-to-partuuid}
          {--exclude=PATTERN} {--exclude-from=FILE}
+		 {--image-size size}
 
+	-i		- Specifie an images file into which copy data instead harddrive.
     -v	    - verbose rsync, list all files as they are copied.
     -f	    - force initialize the destination disk by imaging the booted disk
                 partition structure.  File systems are then synced or imaged.
@@ -140,6 +144,7 @@ usage: $PGM sdN {-v|--verbose} {-f|--force-initialize} {-f2}
     -F      - force file system sync or image for some errors. eg:
                 If source used > destination space error, do the sync anyway.
                 If a source partition mount error, skip it and do other syncs.
+	--image-size - Only if -i is define. Define the size of the final image.
     -x      - use set -x for very verbose bash shell script debugging
     -V      - print rpi-clone version.
 
@@ -266,6 +271,12 @@ unmount_list()
 			qecho "  Failed to unmount: $dir"
 		fi
 	done
+
+	if [ -n "$dest_file_image" -a -n "$dst_disk" ]
+	then
+		qecho "  detaching /dev/$dst_disk from $dest_file_image"
+		losetup -d /dev/$dst_disk
+	fi
 	}
 
 mount_partition()
@@ -583,6 +594,19 @@ get_src_disk()
 	printf -v "${3}" "%s" "$num"
 	}
 
+get_dest_part()
+	{
+		disk=${1}
+		num_part=${2}
+
+		if [[ ${disk} == loop* ]]
+		then
+			echo "${disk}p${num_part}"
+		else
+			echo "${disk}${num_part}"
+		fi
+	}
+
 
 # ==== source (booted) disk info and default mount list
 #
@@ -769,6 +793,8 @@ custom_sync=0
 leave_sd_usb_boot=0
 convert_to_partuuid=0
 p1_size_new=0
+dest_file_image=
+dest_file_image_size=
 
 while [ "$1" ]
 do
@@ -895,6 +921,36 @@ do
 		--convert-fstab-to-partuuid)
 			convert_to_partuuid=1
 			;;
+		-i|--image)
+			shift
+			dest_file_image=$1
+			;;
+		--image-size)
+			shift
+			size=$1
+			if [[ ! $size =~ ^[0-9]+[GM]$ ]]
+			then
+				echo "Bad size value : $size."
+				exit 1
+			fi
+
+			value="${size:0: -1}"
+			mult="${size: -1}"
+			case $mult in
+			M)
+				size=$(( value * 1024 * 1024 ))
+				;;
+			G)
+				size=$(( value * 1024 * 1024 * 1024 ))
+				;;
+			esac
+
+			if [ $size -lt $MIN_IMAGE_SIZE ]
+			then
+				echo "Minimal image size is $MIN_IMAGE_SIZE. Only $size specified."
+			fi
+			dest_file_image_size=$size
+			;;
 		-V|--version)
 			echo $PGM Version: $version
 			exit 0
@@ -940,6 +996,12 @@ if ((usage_error))
 then
 	echo ""
     exit 1
+fi
+
+if [ -n "$dst_disk" ] && [ -n "$dest_file_image" ]
+then
+	echo "-i and sd? options at the same time conflict."
+	exit 1
 fi
 
 if ((convert_to_partuuid))
@@ -1039,6 +1101,51 @@ done
 
 # ==== destination disk checks
 #
+
+if [ -n "$dest_file_image" ]
+then
+	if [ ! -e "$dest_file_image" ]
+	then
+		if [ -z "${dest_file_image_size}" ]
+		then
+			echo "Optionnal argument --image-size not defined and $dest_file_image doesn't yet exist. Cannot be create."
+			exit 1
+		fi
+		qecho "Create empty image at $dest_file_image."
+		mkdir -p $(dirname $dest_file_image)
+		num_block=$(( dest_file_image_size / 1024 / 1024 ))
+		dd if=/dev/zero "of=$dest_file_image" iflag=fullblock bs=1M count=$num_block && sync
+		output_device=$(losetup -f -P "$dest_file_image" --show)
+		dst_disk=${output_device#/dev/}
+		echo "w" | fdisk "${output_device}"
+	elif [ ! -f "$dest_file_image" ]
+	then
+		echo "$dest_file_image is not a valid image file."
+		exit 1
+	elif [ -n "${dest_file_image_size}" ]
+	then
+		file_length=$(stat --format=%s "$dest_file_image")
+		if [ $file_length -ne $dest_file_image_size ]
+		then
+			qecho "Filesize not correspond with --image-size param."
+			confirm "Erase file for resize ?" "abort"
+
+			num_block=$(( dest_file_image_size / 1024 / 1024 ))
+			qecho "Resizing image file"
+			dd if=/dev/zero "of=$dest_file_image" iflag=fullblock bs=1M count=$num_block && sync
+			output_device=$(losetup -f -P "$dest_file_image" --show)
+			dst_disk=${output_device#/dev/}
+			echo "w" | fdisk "${output_device}"
+		else
+			output_device=$(losetup -f -P "$dest_file_image" --show)
+			dst_disk=${output_device#/dev/}
+		fi
+	else
+		output_device=$(losetup -f -P "$dest_file_image" --show)
+		dst_disk=${output_device#/dev/}
+	fi
+fi
+
 if [ "$dst_disk" = "" ]
 then
 	echo "No destination disk given."
@@ -1072,11 +1179,14 @@ then
 			assumed_fstab_edit=0
 		fi
 	else
-		qecho $"
-  Target disk $dst_disk ends with a digit so may be a partition.
-  $PGM requires disk names like 'sda' and not partition names like 'sda1'."
+		if [[ ! $dst_disk =~ ^loop[0-9]+$ ]]
+		then
+			qecho $"
+				Target disk $dst_disk ends with a digit so may be a partition.
+				$PGM requires disk names like 'sda' and not partition names like 'sda1'."
 
-		confirm "Continue anyway?" "abort"
+				confirm "Continue anyway?" "abort"
+		fi
 	fi
 fi
 
@@ -1095,7 +1205,9 @@ fi
 
 dst_disk_size=$(echo "$dst_partition_table" \
 				| grep "^/dev/$dst_disk" | cut -d ":" -f 2 | tr -d 's')
-dst_root_dev=/dev/${dst_part_base}${root_part_num}
+
+dest_root_part=$(get_dest_part "${dst_part_base}" "${root_part_num}")
+dst_root_dev="/dev/$dest_root_part"
 
 dst_mount_table=$(findmnt -o source,target -n -l \
 				| grep "^/dev/$dst_disk" | tr -s " ")
@@ -1120,7 +1232,8 @@ do
 	fi
 	dst_exists[p]=1
 
-	part="${dst_part_base}${p}"
+
+	part=$(get_dest_part "${dst_part_base}" "${p}")
 	dst_partition[p]="$part"
 	dst_device[p]="/dev/$part"
 
@@ -1485,7 +1598,8 @@ Use -U for unattended even if initializing.
 		then
 			continue
 		fi
-		dst_dev=/dev/${dst_part_base}${p}
+		part=$(get_dest_part "${dst_part_base}" "${p}")
+		dst_dev="/dev/$part"
 		fs_type=${src_fs_type[$p]}
 		if    ((p == ext_part_num)) \
 		   || [ "$fs_type" == "--" ]
@@ -1665,7 +1779,9 @@ do
 			qprintf "Syncing unmounted partitions:\n"
 		fi
 		sync_msg_done=1
-		dst_dev=/dev/${dst_part_base}${p}
+
+		part=$(get_dest_part "${dst_part_base}" "${p}")
+		dst_dev="/dev/$part"
 		fs_type=${src_fs_type[$p]}
 		ext_label $p $fs_type "" label
 		if [ "$label" != "" ]
@@ -1711,7 +1827,8 @@ do
 			mkdir -p $dst_dir
 		fi
 
-		dst_dev=/dev/${dst_part_base}${p}
+		part=$(get_dest_part "${dst_part_base}" "${p}")
+		dst_dev="/dev/$part"
 		fs_type=${src_fs_type[$p]}
 		ext_label $p $fs_type "" label
 		if [ "$label" != "" ]
